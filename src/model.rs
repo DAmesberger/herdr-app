@@ -356,6 +356,13 @@ impl Model {
 
     /// Removes a pane. Returns what else closed: the tab, and the space if it was its last.
     pub fn remove_pane(&mut self, pane_id: &str) -> (bool, bool) {
+        let kept = self.space_of_node(pane_id).and_then(|p| self.named_after(p));
+        let removed = self.remove_pane_inner(pane_id);
+        self.keep_folder(kept);
+        removed
+    }
+
+    fn remove_pane_inner(&mut self, pane_id: &str) -> (bool, bool) {
         let Some(c) = self.tab_of_mut(pane_id) else { return (false, false) };
         c.root.remove(pane_id);
         if c.zoomed.as_deref() == Some(pane_id) {
@@ -372,12 +379,46 @@ impl Model {
             return (false, false);
         }
         let id = c.id.clone();
-        let (_, space_closed) = self.remove_tab(&id);
+        let (_, space_closed) = self.remove_tab_inner(&id);
         (true, space_closed)
     }
 
     /// Removes a tab. Returns its terminal addresses and whether its space closed.
     pub fn remove_tab(&mut self, ctx: &str) -> (Vec<String>, bool) {
+        let kept = self.spaces.iter().find(|p| p.tab(ctx).is_some()).and_then(|p| self.named_after(p));
+        let removed = self.remove_tab_inner(ctx);
+        self.keep_folder(kept);
+        removed
+    }
+
+    /// The space and folder an unnamed space is called after while it has a
+    /// terminal (see `space_name`).
+    fn named_after(&self, p: &Space) -> Option<(String, String)> {
+        if !p.name.is_empty() {
+            return None;
+        }
+        let first = p.tabs.iter().flat_map(|c| c.root.terminals()).next()?;
+        let folder = first.terminal().and_then(|a| self.folder_info.get(a)).map(|f| f.top.clone())
+            .or_else(|| self.pane_folders.get(&first.id).cloned())?;
+        Some((p.id.clone(), folder))
+    }
+
+    /// A space left with only mod tabs (a VM, a board) keeps the folder it was
+    /// called after, instead of falling back to the one it was made in and
+    /// passing for another space.
+    fn keep_folder(&mut self, kept: Option<(String, String)>) {
+        let Some((id, folder)) = kept else { return };
+        let Some(p) = self.space_mut(&id) else { return };
+        if p.tabs.iter().all(|c| c.root.terminals().is_empty()) {
+            p.folder = folder;
+        }
+    }
+
+    fn space_of_node(&self, node: &str) -> Option<&Space> {
+        self.spaces.iter().find(|p| p.tabs.iter().any(|c| c.root.find(node).is_some()))
+    }
+
+    fn remove_tab_inner(&mut self, ctx: &str) -> (Vec<String>, bool) {
         let Some(pi) = self.spaces.iter().position(|p| p.tab(ctx).is_some()) else { return (vec![], false) };
         let p = &mut self.spaces[pi];
         let ci = p.tabs.iter().position(|c| c.id == ctx).unwrap();
@@ -672,6 +713,27 @@ mod tests {
         assert_eq!(names.iter().map(String::as_str).collect::<Vec<_>>(), ["1", "review", "3"]);
         m.space_mut("p1").unwrap().name = "api".into();
         assert_eq!(m.space_name(m.space("p1").unwrap(), "/home/me"), "api");
+    }
+
+    #[test]
+    fn a_space_left_with_only_a_mod_tab_keeps_its_name() {
+        let mut m = Model::default();
+        m.add_space("p1", "", "/src/other", Tab::new("c1", "", "x1", "t1"));
+        let vm = crate::layout::Node::block("x2", crate::layout::Content::Mod { name: "virtual-machine".into(), props: serde_json::Value::Null });
+        m.add_tab("p1", Tab::with_pane("c2", "macOS VM", vm));
+        m.folder_info.insert("t1".into(), FolderInfo { top: "/src/sparksmith".into(), branch: None });
+        assert_eq!(m.space_name(m.space("p1").unwrap(), "/home/me"), "sparksmith");
+        // Its terminal ends: the VM tab stays, under the same name.
+        let (tab_closed, space_closed) = m.remove_pane("x1");
+        assert!(tab_closed && !space_closed);
+        assert_eq!(m.space_name(m.space("p1").unwrap(), "/home/me"), "sparksmith");
+        // Closing a terminal tab directly does the same.
+        let mut m2 = Model::default();
+        m2.add_space("p1", "", "/src/other", Tab::new("c1", "", "x1", "t1"));
+        m2.add_tab("p1", Tab::with_pane("c2", "", crate::layout::Node::block("x2", crate::layout::Content::Mod { name: "virtual-machine".into(), props: serde_json::Value::Null })));
+        m2.pane_folders.insert("x1".into(), "/src/notes".into());
+        m2.remove_tab("c1");
+        assert_eq!(m2.space_name(m2.space("p1").unwrap(), "/home/me"), "notes");
     }
 
     #[test]
