@@ -92,7 +92,12 @@ Treat the three forms of “passwordless” separately:
    Settings or the detected version's documented account-management tool. Keep
    a real account password for administrator prompts. Read the guest tool's
    help rather than assuming host flags. Provisioning requests automatic login,
-   but that is not proof it works, especially after changing the password.
+   but that is not proof it works, especially after changing the password:
+   the stored automatic-login secret keeps the provisioning password, so
+   `sysadminctl -autologin status` still names the user while the guest boots
+   to the login window. After any password change, re-enable automatic login
+   (System Settings › Users & Groups › Automatic login). On macOS 27.2,
+   `sysadminctl -autologin set` fails with `SACSetAutoLoginPassword error:22`.
 3. **Administrator commands:** keep password-authenticated sudo by default;
    the shutdown helper supplies the saved password privately. If the user
    specifically requests passwordless sudo, configure a guest-only sudoers

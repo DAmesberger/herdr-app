@@ -55,15 +55,39 @@ final class VMApplicationDelegate: NSObject, NSApplicationDelegate {
         shuttingDown = true
         Task { @MainActor in
             defer { shuttingDown = false }
-            do {
-                if vm.state == .running { try vm.requestStop() }
-                core.status("stopping", "Quit requested; finish any shutdown prompts inside the guest")
-                for _ in 0..<120 {
+            if vm.state == .running {
+                do { try await core.shutDownGuest(vm) }
+                catch { core.status("error", "Guest shutdown failed: \(error.localizedDescription)") }
+            }
+            while true {
+                for _ in 0..<240 {
                     if vm.state == .stopped { sender.terminate(nil); return }
-                    try await Task.sleep(nanoseconds: 250_000_000)
+                    try? await Task.sleep(nanoseconds: 250_000_000)
                 }
-                core.status("running", "Quit cancelled: the guest did not shut down. Finish its prompts, then quit again.")
-            } catch { core.status("error", "Quit cancelled: \(error.localizedDescription)") }
+                // Never cancel the quit silently: the status line may be hidden.
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.messageText = "The macOS VM is still running"
+                alert.informativeText = "Herdr asked the guest to shut down, but it has not stopped after a minute. " +
+                    "Force Stop cuts its power immediately; unsaved work inside the guest is lost."
+                alert.addButton(withTitle: "Keep Waiting")
+                alert.addButton(withTitle: "Force Stop")
+                alert.addButton(withTitle: "Cancel Quit")
+                switch alert.runModal() {
+                case .alertFirstButtonReturn:
+                    continue
+                case .alertSecondButtonReturn:
+                    do {
+                        try await vm.stop()
+                        core.status("stopped", "Force stopped on quit")
+                        sender.terminate(nil)
+                    } catch { core.status("error", "Force stop failed: \(error.localizedDescription)") }
+                    return
+                default:
+                    core.status("running", "Quit cancelled; the guest is still running")
+                    return
+                }
+            }
         }
         return .terminateCancel
     }

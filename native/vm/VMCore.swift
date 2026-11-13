@@ -31,7 +31,8 @@ final class VMCore: NSObject, @preconcurrency VZVirtualMachineDelegate {
         super.init()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        lockFD = Darwin.open(path("runtime.lock").path, O_CREAT | O_RDWR, 0o600)
+        // CLOEXEC: children (mod bridges, ssh) must not inherit and outlive the lock.
+        lockFD = Darwin.open(path("runtime.lock").path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
             throw VMError(message: "This VM is already owned by another process.")
         }
@@ -171,6 +172,64 @@ final class VMCore: NSObject, @preconcurrency VZVirtualMachineDelegate {
         status("starting")
         try await vm.start(options: options)
         status("running", "Native display; \(settings?.cpuCount ?? 0) CPUs, \((settings?.memoryBytes ?? 0) / (1024 * 1024 * 1024)) GiB RAM")
+    }
+
+    /// The guest's address from the host's NAT DHCP leases, matched by MAC.
+    func guestAddress() -> String? {
+        guard let mac = settings?.macAddress,
+              let leases = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else { return nil }
+        func normal(_ value: String) -> String {
+            value.split(separator: ":").map { String(format: "%02x", Int($0, radix: 16) ?? -1) }.joined(separator: ":")
+        }
+        let wanted = normal(mac)
+        for block in leases.components(separatedBy: "}") {
+            var values: [String: String] = [:]
+            for line in block.split(separator: "\n") {
+                let parts = line.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1)
+                if parts.count == 2 { values[String(parts[0])] = String(parts[1]) }
+            }
+            if let hw = values["hw_address"]?.split(separator: ",").last, normal(String(hw)) == wanted,
+               let ip = values["ip_address"] { return ip }
+        }
+        return nil
+    }
+
+    /// `requestStop` on a macOS guest is a power-button press: it opens a
+    /// confirmation dialog in the guest that nobody may be looking at. Ask the
+    /// guest OS to shut down over the private SSH transport instead (the same
+    /// path as `scripts/vm/guest shutdown`). False when that was not possible.
+    func requestGuestShutdown() async -> Bool {
+        guard let settings, let address = guestAddress() else { return false }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=\(path("known_hosts").path)",
+            "-i", path("ssh-key").path, "\(settings.username)@\(address)", "sudo -S -p '' /sbin/shutdown -h now"]
+        let input = Pipe(), output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        let finished: Bool = await withCheckedContinuation { done in
+            process.terminationHandler = { _ in done.resume(returning: true) }
+            do { try process.run() } catch { done.resume(returning: false); return }
+            input.fileHandleForWriting.write(Data((settings.password + "\n").utf8))
+            try? input.fileHandleForWriting.close()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 15) { if process.isRunning { process.terminate() } }
+        }
+        guard finished else { return false }
+        let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // The connection may drop as the guest goes down, so accept the banner too.
+        return process.terminationStatus == 0 || text.contains("Shutdown NOW")
+    }
+
+    /// Shut the guest down without a guest-side prompt when possible.
+    func shutDownGuest(_ vm: VZVirtualMachine) async throws {
+        if await requestGuestShutdown() {
+            status("stopping", "Guest shutting down")
+        } else {
+            try vm.requestStop()
+            status("stopping", "Confirm the shutdown prompt inside the guest")
+        }
     }
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) { status("stopped") }

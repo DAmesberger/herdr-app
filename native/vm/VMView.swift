@@ -100,8 +100,11 @@ final class VMPanel: NSObject {
             return
         }
         guard vm.state == .running else { return }
-        do { try vm.requestStop(); core?.status("stopping", "Guest shutdown requested") }
-        catch { label.stringValue = error.localizedDescription }
+        guard let core else { return }
+        Task { @MainActor in
+            do { try await core.shutDownGuest(vm) }
+            catch { label.stringValue = error.localizedDescription }
+        }
     }
 
     func refresh() {
