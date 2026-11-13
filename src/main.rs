@@ -1,5 +1,5 @@
-// Windows: a window app, no console of its own (see `attach_console`).
-#![cfg_attr(windows, windows_subsystem = "windows")]
+// Windows: a window app, but tests inherit Cargo's console for their child processes.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod bench;
 mod commands;
@@ -18,6 +18,8 @@ mod place;
 mod persist;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_check;
 mod mods;
 mod mod_files;
 mod process_cwd;
@@ -77,6 +79,8 @@ fn attach_console() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "macos")]
+    macos_check::startup(&args);
     #[cfg(windows)]
     if args.len() > 1 {
         attach_console();
@@ -113,6 +117,7 @@ fn main() {
         )
         .init();
 
+    update::leave_install_folder();
     if update::apply_on_startup() {
         return;
     }
@@ -132,7 +137,7 @@ fn main() {
                 Ok(core) => hc::check(&core.hello).map(|()| core).map_err(setup::Need::Fix),
                 Err(e) => {
                     eprintln!("herdr-app: {e:#}");
-                    Err(setup::Need::Install)
+                    Err(setup::Need::connection(e))
                 }
             }
         }
@@ -150,7 +155,8 @@ fn main() {
     }
 
     gpui_platform::application()
-        .with_assets(gpui_shell::AppAssets::new(mods::app_dir()))
+        // Mods run programs already; the user's own links (dotfiles, Nix) may point out.
+        .with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links())
         .run(move |cx| {
             let fonts = settings::BUNDLED_FONTS.iter().map(|f| std::borrow::Cow::Borrowed(*f)).collect();
             if let Err(e) = cx.text_system().add_fonts(fonts) {
@@ -214,6 +220,10 @@ pub fn open_main(core: std::sync::Arc<hc::Core>, requests: async_channel::Receiv
                     traffic_light_position: cfg!(target_os = "macos").then(|| point(px(12.0), px(7.0))),
                 }),
                 app_owns_titlebar_drag: cfg!(target_os = "macos"),
+                // Linux: open with the title bar the shipped layouts draw. Turning the
+                // system's off on the first render, while KWin maps the window, shrinks
+                // it to 20x20; turning it on later (a "system" layout) is fine.
+                window_decorations: Some(WindowDecorations::Client),
                 // Herdr Dev and other side-by-side builds get their own dock icon.
                 app_id: Some(std::env::var("HERDR_APP_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr-app".into())),
                 ..Default::default()

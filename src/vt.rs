@@ -595,6 +595,16 @@ fn hyperlink_uri(r: &GhosttyGridRef) -> Option<String> {
     (res == GHOSTTY_SUCCESS && len > 0).then(|| String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
+fn is_wide(r: &GhosttyGridRef) -> bool {
+    let mut cell: GhosttyCell = Default::default();
+    let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+    let read = unsafe {
+        ghostty_grid_ref_cell(r, &mut cell) == GHOSTTY_SUCCESS
+            && ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
+    };
+    read && wide == GHOSTTY_CELL_WIDE_WIDE
+}
+
 #[derive(Clone, Copy)]
 pub enum Select {
     Press,
@@ -1441,8 +1451,13 @@ impl Vt {
             if start_ok != GHOSTTY_SUCCESS || end_ok != GHOSTTY_SUCCESS {
                 continue;
             }
-            if (start.y, start.x) > (end.y, end.x) {
+            let swapped = (start.y, start.x) > (end.y, end.x);
+            if swapped {
                 std::mem::swap(&mut start, &mut end);
+            }
+            // A match ends on a wide character's first cell; cover its second too.
+            if is_wide(if swapped { &matched.start } else { &matched.end }) {
+                end.x += 1;
             }
             let last_row = end.y.min(self.rows.saturating_sub(1) as u32);
             if start.y >= self.rows as u32 || start.y > last_row {
@@ -1513,6 +1528,10 @@ impl Vt {
             }
             (cursor, generation, colors)
         }
+    }
+
+    pub fn render_hold_deadline(&self) -> Option<Instant> {
+        self.shared.held_since.map(|since| since + MAX_HOLD)
     }
 
     /// Updates the render state (respecting synchronized output) and reads one frame.
@@ -1759,9 +1778,23 @@ impl Vt {
             if action == GHOSTTY_MOUSE_ACTION_MOTION && self.last_mouse_report == buf[..len] {
                 return Vec::new();
             }
+            let report = buf[..len].to_vec();
+            // Remember the motion equivalent of a press/release, so a focus click
+            // cannot start a drag at the same cell. Let the encoder handle each
+            // format's coordinates, including the finer SGR-pixel positions.
+            if action != GHOSTTY_MOUSE_ACTION_MOTION {
+                ghostty_mouse_event_set_action(e, GHOSTTY_MOUSE_ACTION_MOTION);
+                if action == GHOSTTY_MOUSE_ACTION_RELEASE {
+                    ghostty_mouse_event_clear_button(e);
+                }
+                len = 0;
+                if ghostty_mouse_encoder_encode(self.mouse, e, buf.as_mut_ptr() as *mut _, buf.len(), &mut len) != GHOSTTY_SUCCESS {
+                    len = 0;
+                }
+            }
             self.last_mouse_report.clear();
             self.last_mouse_report.extend_from_slice(&buf[..len]);
-            buf[..len].to_vec()
+            report
         }
     }
 }
@@ -1861,6 +1894,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_search_highlights_both_cells_of_a_wide_character() {
+        let spans = |cols: u16, text: &str, query: &str| {
+            let mut vt = Vt::new(cols, 3);
+            vt.write(text.as_bytes());
+            vt.start_search(query);
+            finish_search(&mut vt);
+            vt.search_spans.iter().map(|span| (span.row, span.start, span.end)).collect::<Vec<_>>()
+        };
+        assert_eq!(spans(20, "日本語 ab", "本"), vec![(0, 2, 3)]);
+        assert_eq!(spans(20, "日本語 ab", "日本"), vec![(0, 0, 3)]);
+        assert_eq!(spans(20, "x😀y", "😀"), vec![(0, 1, 2)]);
+        assert_eq!(spans(6, "abcd日", "日"), vec![(0, 4, 5)], "in the last two columns");
+        assert_eq!(spans(5, "abcd日", "d日"), vec![(0, 3, 4), (1, 0, 1)], "wrapped to the next row");
+        assert_eq!(spans(20, "日本語 ab", "語 a"), vec![(0, 4, 7)], "a narrow end keeps its own cell");
+    }
+
+    #[test]
     fn scrollback_retains_five_thousand_styled_lines() {
         for cols in [80, 200] {
             let mut vt = Vt::new(cols, 25);
@@ -1887,6 +1937,20 @@ mod tests {
         assert!(f.rows[0][0].wide, "also after a reset");
         assert_eq!(f.rows[0][0].text, "\u{270d}\u{fe0f}");
         assert_eq!(f.rows[0][2].text, "!");
+    }
+
+    #[test]
+    fn synchronized_output_releases_at_its_deadline() {
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"before");
+        vt.write(b"\x1b[?2026h\r\x1b[Kafter");
+        let text = |frame: Frame| frame.rows[0].iter().map(|c| c.text.as_str()).collect::<String>();
+        assert!(text(vt.frame()).starts_with("before"));
+        let since = Instant::now() - MAX_HOLD - Duration::from_millis(1);
+        vt.shared.held_since = Some(since);
+        assert_eq!(vt.render_hold_deadline(), Some(since + MAX_HOLD));
+        assert!(text(vt.frame()).starts_with("after"));
+        assert_eq!(vt.render_hold_deadline(), None);
     }
 
     #[test]
@@ -2088,6 +2152,35 @@ mod tests {
         vt.write(b"\x1b[?1003h\x1b[?1016h");
         assert_eq!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, None, 0, 15.0, 5.0, size, false), b"\x1b[<35;15;5M");
         assert_eq!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, None, 0, 16.0, 5.0, size, false), b"\x1b[<35;16;5M");
+    }
+
+    #[test]
+    fn mouse_clicks_do_not_report_same_cell_drags_in_any_cell_encoding() {
+        let size = (80, 2, 11.7, 20.0);
+        for tracking in [b"\x1b[?1002h".as_slice(), b"\x1b[?1003h"] {
+            for format in [b"".as_slice(), b"\x1b[?1005h", b"\x1b[?1006h", b"\x1b[?1015h"] {
+                let mut vt = Vt::new(80, 2);
+                vt.write(tracking);
+                vt.write(format);
+                let left = Some(GHOSTTY_MOUSE_BUTTON_LEFT);
+                for _ in 0..2 {
+                    assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, left, 0, 15.0, 5.0, size, true).is_empty());
+                    assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 15.0, 5.0, size, true).is_empty());
+                    assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 16.0, 6.0, size, true).is_empty());
+                    assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_RELEASE, left, 0, 16.0, 6.0, size, false).is_empty());
+                    assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, None, 0, 16.0, 6.0, size, false).is_empty());
+                }
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, left, 0, 15.0, 5.0, size, true).is_empty());
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 25.0, 5.0, size, true).is_empty());
+                assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 26.0, 6.0, size, true).is_empty());
+                // Another button can report at the same cell; press/release are never filtered.
+                let right = Some(GHOSTTY_MOUSE_BUTTON_RIGHT);
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, right, 0, 25.0, 5.0, size, true).is_empty());
+                assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, right, 0, 26.0, 6.0, size, true).is_empty());
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 26.0, 6.0, size, true).is_empty());
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_RELEASE, right, 0, 26.0, 6.0, size, true).is_empty());
+            }
+        }
     }
 
     #[test]

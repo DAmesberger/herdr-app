@@ -49,7 +49,7 @@ vm-test:
     bash scripts/vm/test-native
 
 test:
-    bun test scripts/files.test.ts scripts/picker.test.ts scripts/palette.test.ts scripts/agents.test.ts scripts/spaces.test.ts scripts/worktree.test.ts
+    bun test scripts/files.test.ts scripts/machine-add.test.ts scripts/picker.test.ts scripts/palette.test.ts scripts/agents.test.ts scripts/spaces.test.ts scripts/worktree.test.ts
     cargo test --locked
 
 docs-generate: build
